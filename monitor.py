@@ -164,6 +164,53 @@ def fetch_amazon():
         print("  WARN Amazon error:", e)
         return []
 
+
+# Direct Greenhouse scrapers for priority companies that open EARLY
+# (July-Oct). These beat Simplify's lag by minutes-to-hours.
+# Tries both Greenhouse API hosts so token/domain quirks don't break it.
+DIRECT_GREENHOUSE = {
+    "Databricks": "Databricks",
+    "Stripe":     "stripe",
+    "Anthropic":  "anthropic",
+    "OpenAI":     "openai",
+    "Robinhood":  "robinhood",
+    "Coinbase":   "coinbase",
+    "Figma":      "figma",
+}
+
+
+def fetch_direct_greenhouse():
+    jobs = []
+    for company, token in DIRECT_GREENHOUSE.items():
+        got = None
+        for host in ("boards-api.greenhouse.io", "job-boards.greenhouse.io"):
+            try:
+                r = requests.get(
+                    "https://" + host + "/v1/boards/" + token + "/jobs",
+                    headers=HEADERS, timeout=15,
+                )
+                if r.status_code == 404:
+                    continue
+                r.raise_for_status()
+                got = r.json().get("jobs", [])
+                break
+            except Exception:
+                continue
+        if got is None:
+            print("  WARN direct greenhouse failed:", company)
+            continue
+        for j in got:
+            jobs.append({
+                "id":       "ghd_" + token + "_" + str(j["id"]),
+                "company":  company,
+                "title":    j.get("title", ""),
+                "location": (j.get("location") or {}).get("name", ""),
+                "url":      j.get("absolute_url", ""),
+                "posted":   (j.get("updated_at", "") or "")[:10],
+                "season":   "",
+            })
+    return jobs
+
 # ---------------------------------------------------------------------------
 # FILTERS
 # ---------------------------------------------------------------------------
@@ -324,8 +371,8 @@ def daily_digest(digest_jobs, sources_ok):
 # MAIN
 # ---------------------------------------------------------------------------
 
-def run_once(seen, pending_digest):
-    all_jobs = fetch_simplify() + fetch_amazon()
+def run_once(seen, pending_digest, first_run=False):
+    all_jobs = fetch_simplify() + fetch_amazon() + fetch_direct_greenhouse()
     sources_ok = len(all_jobs) > 0
 
     instant = []
@@ -345,7 +392,8 @@ def run_once(seen, pending_digest):
             pending_digest.append(j)
         # else: not a tracked company -> dropped silently
 
-    if instant:
+    # On the very first run we only index; never blast existing jobs.
+    if instant and not first_run:
         instant_alert(instant)
 
     return sources_ok
@@ -367,15 +415,16 @@ def main():
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
         print("\n[" + now + "] Polling...")
 
-        sources_ok = run_once(seen, pending_digest)
+        sources_ok = run_once(seen, pending_digest, first_run=first_run)
         save_json(STATE_FILE, list(seen))
-        save_json(DIGEST_FILE, pending_digest)
 
         if first_run:
-            print("  First run - indexed", len(seen), "existing jobs. No email.")
+            print("  First run - indexed", len(seen), "existing jobs. No emails sent.")
             pending_digest.clear()
             save_json(DIGEST_FILE, pending_digest)
             first_run = False
+        else:
+            save_json(DIGEST_FILE, pending_digest)
 
         if date.today() > last_digest:
             daily_digest(pending_digest, sources_ok)
