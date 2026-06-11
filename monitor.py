@@ -288,12 +288,15 @@ def is_usa(location):
     if not location:
         return True
     loc = location.lower()
-    return any(h in loc for h in [
-        "united states", " us ", "u.s.", "usa", "remote",
-        "seattle", "san francisco", "new york", "austin", "boston",
-        "chicago", "los angeles", "menlo park", "cupertino", "bellevue",
-        "redmond", "sunnyvale", "mountain view", "palo alto", "cambridge",
-    ])
+    # exclude explicitly non-US
+    non_us = [
+        "canada", "mexico", "uk", "united kingdom", "ireland",
+        "estonia", "poland", "australia", "hong kong", "india",
+        "singapore", "germany", "france", "netherlands",
+    ]
+    if any(x in loc for x in non_us):
+        return False
+    return True
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STATE
