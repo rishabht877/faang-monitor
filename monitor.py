@@ -94,8 +94,14 @@ HEADERS = {
 }
 
 SIMPLIFY_FEEDS = [
-    "https://raw.githubusercontent.com/SimplifyJobs/New-Grad-Positions/dev/.github/scripts/listings.json",
+    # Summer 2026 internships (this coming summer)
     "https://raw.githubusercontent.com/SimplifyJobs/Summer2026-Internships/dev/.github/scripts/listings.json",
+    # Summer 2027 internships / co-ops (your main window, May 2027 grad)
+    "https://raw.githubusercontent.com/vanshb03/Summer2027-Internships/dev/.github/scripts/listings.json",
+    # New grad full-time (2025/2026, some 2027-start) - SimplifyJobs
+    "https://raw.githubusercontent.com/SimplifyJobs/New-Grad-Positions/dev/.github/scripts/listings.json",
+    # New grad full-time - vanshb03 mirror (extra coverage)
+    "https://raw.githubusercontent.com/vanshb03/New-Grad-2026/dev/.github/scripts/listings.json",
 ]
 
 
@@ -118,6 +124,7 @@ def fetch_simplify():
                 if not j.get("active", True) or not j.get("is_visible", True):
                     continue
                 locs = j.get("locations") or []
+                terms = j.get("terms") or []
                 jobs.append({
                     "id":       "simplify_" + str(j.get("id", j.get("url", ""))),
                     "company":  j.get("company_name", ""),
@@ -125,6 +132,7 @@ def fetch_simplify():
                     "location": ", ".join(locs) if isinstance(locs, list) else str(locs),
                     "url":      j.get("url", ""),
                     "posted":   _ts_to_date(j.get("date_posted")),
+                    "season":   ", ".join(terms) if isinstance(terms, list) else str(terms),
                 })
         except Exception as e:
             print("  WARN Simplify feed error:", e)
@@ -148,6 +156,7 @@ def fetch_amazon():
                 "location": j.get("normalized_location", ""),
                 "url":      "https://www.amazon.jobs" + j.get("job_path", ""),
                 "posted":   j.get("posted_date", ""),
+                "season":   "Full-Time",
             }
             for j in r.json().get("jobs", [])
         ]
@@ -170,13 +179,31 @@ def is_usa(location):
         return True
     loc = location.lower()
     non_us = [
-        "canada", "mexico", "united kingdom", " uk", "ireland", "estonia",
-        "poland", "australia", "hong kong", "india", "singapore", "germany",
-        "france", "netherlands", "brazil", "japan", "korea", "china",
-        "spain", "italy", "sweden", "israel", "toronto", "vancouver",
-        "london", "dublin", "bangalore",
+        # countries (full + common abbreviations)
+        "canada", "mexico", "united kingdom", " uk", "u.k.", "ireland",
+        "estonia", "poland", "australia", "hong kong", "india", "singapore",
+        "germany", "deu", "france", "netherlands", "brazil", "japan", "korea",
+        "china", "spain", "italy", "sweden", "israel", "switzerland", "swe ",
+        "austria", "belgium", "denmark", "finland", "norway", "portugal",
+        "romania", "czech", "hungary", "greece", "turkey", "uae", "taiwan",
+        "philippines", "vietnam", "thailand", "malaysia", "indonesia",
+        "argentina", "chile", "colombia", "peru", "egypt", "nigeria",
+        "south africa", "new zealand", "scotland", "wales",
+        # non-US cities that show up a lot
+        "toronto", "vancouver", "montreal", "ottawa", "waterloo, on",
+        "london", "dublin", "bangalore", "bengaluru", "hyderabad", "pune",
+        "berlin", "munich", "paris", "amsterdam", "zurich", "stockholm",
+        "tel aviv", "sydney", "melbourne", "tokyo", "seoul", "shanghai",
+        "beijing", "shenzhen", "sao paulo", "mexico city", "warsaw",
+        "barcelona", "madrid", "milan", "lisbon", "prague", "bucharest",
     ]
-    if any(x in loc for x in non_us) and "united states" not in loc and ", ca" not in loc:
+    # If any non-US signal appears AND there's no explicit US signal, drop it.
+    # Note: ", ca" matches California but NOT "canada" (which is caught above first).
+    us_signal = (
+        "united states" in loc or "usa" in loc or "u.s." in loc or
+        (", ca" in loc and "canada" not in loc)
+    )
+    if any(x in loc for x in non_us) and not us_signal:
         return False
     return True
 
@@ -243,6 +270,7 @@ def job_rows(jobs):
             "<td style='padding:8px;border-bottom:1px solid #eee'><b>" + j["company"] + "</b></td>"
             "<td style='padding:8px;border-bottom:1px solid #eee'>"
             "<a href='" + j["url"] + "' style='color:#0066cc'>" + j["title"] + "</a></td>"
+            "<td style='padding:8px;border-bottom:1px solid #eee'>" + j.get("season", "") + "</td>"
             "<td style='padding:8px;border-bottom:1px solid #eee'>" + j["location"] + "</td>"
             "</tr>"
         )
@@ -258,6 +286,7 @@ def instant_alert(jobs):
         "<thead><tr style='background:#f4f4f4'>"
         "<th style='padding:8px;text-align:left'>Company</th>"
         "<th style='padding:8px;text-align:left'>Role</th>"
+        "<th style='padding:8px;text-align:left'>Season</th>"
         "<th style='padding:8px;text-align:left'>Location</th>"
         "</tr></thead><tbody>" + job_rows(jobs) + "</tbody></table>"
         "</body></html>"
@@ -272,7 +301,7 @@ def daily_digest(digest_jobs, sources_ok):
     if digest_jobs:
         body = job_rows(digest_jobs)
     else:
-        body = "<tr><td colspan=3 style='padding:8px;color:#888'>No new broader-company roles today.</td></tr>"
+        body = "<tr><td colspan=4 style='padding:8px;color:#888'>No new broader-company roles today.</td></tr>"
     html = (
         "<html><body style='font-family:sans-serif;max-width:900px;margin:auto'>"
         "<h2 style='color:#00b894'>Daily Digest - " + datetime.now().strftime("%b %d, %Y") + "</h2>"
@@ -282,6 +311,7 @@ def daily_digest(digest_jobs, sources_ok):
         "<thead><tr style='background:#f4f4f4'>"
         "<th style='padding:8px;text-align:left'>Company</th>"
         "<th style='padding:8px;text-align:left'>Role</th>"
+        "<th style='padding:8px;text-align:left'>Season</th>"
         "<th style='padding:8px;text-align:left'>Location</th>"
         "</tr></thead><tbody>" + body + "</tbody></table>"
         "<p style='color:#888;font-size:12px'>FAANG+ roles are sent instantly. This digest covers everything else.</p>"
