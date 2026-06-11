@@ -1,42 +1,79 @@
 #!/usr/bin/env python3
 """
-FAANG+ Internship & New Grad SDE Job Monitor
+Job Monitor v2 - Simplify feeds + direct Amazon API
+Two-tier alerts:
+  - INSTANT email  -> FAANG + top tech (priority companies)
+  - DAILY DIGEST   -> everything else relevant, bundled once a day with heartbeat
 Runs continuously on Railway. Polls every 10 minutes.
-Sends email on new jobs + a daily heartbeat so you know it's alive.
 """
 
 import requests
 import json
 import time
-import smtplib
 import os
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from datetime import datetime, date
-from bs4 import BeautifulSoup
+from datetime import datetime, date, timezone
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CONFIG — loaded from environment variables (set these in Railway dashboard)
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# CONFIG (env vars set in Railway)
+# ---------------------------------------------------------------------------
 
-EMAIL_FROM         = os.environ["EMAIL_FROM"]        # your Gmail address
-EMAIL_TO           = os.environ["EMAIL_TO"]          # where alerts go (can be same)
-SMTP_PASSWORD      = os.environ["SMTP_PASSWORD"]     # Gmail App Password
-POLL_INTERVAL_SECS = 10 * 60                         # 10 minutes
-STATE_FILE         = "/app/data/seen_jobs.json"      # persisted on Railway volume
+EMAIL_FROM         = os.environ["EMAIL_FROM"]
+EMAIL_TO           = os.environ["EMAIL_TO"]
+SENDGRID_API_KEY   = os.environ["SENDGRID_API_KEY"]
+POLL_INTERVAL_SECS = 10 * 60
+STATE_FILE         = "/app/data/seen_jobs.json"
+DIGEST_FILE        = "/app/data/pending_digest.json"
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# PRIORITY COMPANIES -> trigger INSTANT email
+# Everything else relevant goes to the daily digest.
+# Matching is case-insensitive substring on company name.
+# ---------------------------------------------------------------------------
+
+PRIORITY_COMPANIES = [
+    # FAANG + top tech
+    "amazon", "google", "meta", "facebook", "apple", "microsoft",
+    "netflix", "stripe", "nvidia", "openai", "anthropic", "databricks",
+    # added per request
+    "robinhood", "coinbase", "figma", "rippling", "snap", "reddit",
+    "doordash", "jane street", "citadel",
+]
+
+# DIGEST allowlist -> these get bundled into the daily digest.
+# Anything NOT in priority and NOT here is dropped silently (no random startups).
+DIGEST_COMPANIES = [
+    # big tech / well-known
+    "linkedin", "salesforce", "adobe", "intuit", "workday", "servicenow",
+    "atlassian", "shopify", "spotify", "uber", "lyft", "airbnb", "pinterest",
+    "dropbox", "block", "square", "paypal", "twilio", "cloudflare", "datadog",
+    "snowflake", "mongodb", "palantir", "scale ai", "waymo", "cruise",
+    "instacart", "doordash", "roblox", "unity", "twitch", "discord",
+    # fintech / startups (strong)
+    "brex", "ramp", "plaid", "chime", "affirm", "sofi", "gusto", "notion",
+    "asana", "duolingo", "grammarly", "samsara", "verkada", "anduril",
+    "spacex", "applied intuition", "rivian", "lucid",
+    # security
+    "crowdstrike", "okta", "palo alto", "zscaler", "cloudflare", "sentinelone",
+    # quant / trading
+    "hudson river", "two sigma", "optiver", "imc", "akuna", "drw", "jump trading",
+    "five rings", "sig", "jane street", "citadel", "de shaw", "point72",
+    "virtu", "flow traders", "tower research", "millennium",
+    # AI labs
+    "cohere", "mistral", "perplexity", "scale", "hugging face", "runway",
+    "character", "adept", "together ai",
+]
+
+# ---------------------------------------------------------------------------
 # KEYWORDS
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
 TITLE_KEYWORDS = [
     "software engineer", "software developer", "sde", "swe",
-    "backend engineer", "frontend engineer", "fullstack", "full stack",
-    "machine learning engineer", "ml engineer", "data engineer",
-    "platform engineer", "infrastructure engineer", "site reliability",
-    "systems engineer", "computer vision", "ai engineer",
-    "intern", "internship", "new grad", "university grad",
-    "associate engineer", "entry level engineer",
+    "backend", "frontend", "front end", "fullstack", "full stack",
+    "machine learning", "ml engineer", "data engineer", "platform engineer",
+    "infrastructure engineer", "site reliability", "systems engineer",
+    "ai engineer", "new grad", "university grad", "intern",
+    "associate engineer", "entry level",
 ]
 
 EXCLUDE_KEYWORDS = [
@@ -44,9 +81,9 @@ EXCLUDE_KEYWORDS = [
     "manager", "vp ", "vice president", "head of", "lead engineer",
 ]
 
-# ─────────────────────────────────────────────────────────────────────────────
-# FETCHERS
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# DATA SOURCES
+# ---------------------------------------------------------------------------
 
 HEADERS = {
     "User-Agent": (
@@ -56,390 +93,267 @@ HEADERS = {
     )
 }
 
-def greenhouse(token):
-    url = f"https://boards-api.greenhouse.io/v1/boards/{token}/jobs"
-    r = requests.get(url, headers=HEADERS, timeout=15)
-    r.raise_for_status()
-    return [
-        {
-            "id":       f"gh_{token}_{j['id']}",
-            "title":    j.get("title", ""),
-            "location": j.get("location", {}).get("name", ""),
-            "url":      j.get("absolute_url", ""),
-            "posted":   j.get("updated_at", "")[:10],
-        }
-        for j in r.json().get("jobs", [])
-    ]
+SIMPLIFY_FEEDS = [
+    "https://raw.githubusercontent.com/SimplifyJobs/New-Grad-Positions/dev/.github/scripts/listings.json",
+    "https://raw.githubusercontent.com/SimplifyJobs/Summer2026-Internships/dev/.github/scripts/listings.json",
+]
 
 
-def lever(token):
-    url = f"https://api.lever.co/v0/postings/{token}?mode=json&limit=500"
-    r = requests.get(url, headers=HEADERS, timeout=15)
-    r.raise_for_status()
-    return [
-        {
-            "id":       f"lv_{token}_{j['id']}",
-            "title":    j.get("text", ""),
-            "location": j.get("categories", {}).get("location", ""),
-            "url":      j.get("hostedUrl", ""),
-            "posted":   datetime.fromtimestamp(j["createdAt"] / 1000).strftime("%Y-%m-%d")
-                        if j.get("createdAt") else "",
-        }
-        for j in r.json()
-    ]
+def _ts_to_date(ts):
+    if not ts:
+        return ""
+    try:
+        return datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%d")
+    except Exception:
+        return ""
 
 
-def amazon_jobs():
+def fetch_simplify():
+    jobs = []
+    for feed in SIMPLIFY_FEEDS:
+        try:
+            r = requests.get(feed, headers=HEADERS, timeout=20)
+            r.raise_for_status()
+            for j in r.json():
+                if not j.get("active", True) or not j.get("is_visible", True):
+                    continue
+                locs = j.get("locations") or []
+                jobs.append({
+                    "id":       "simplify_" + str(j.get("id", j.get("url", ""))),
+                    "company":  j.get("company_name", ""),
+                    "title":    j.get("title", ""),
+                    "location": ", ".join(locs) if isinstance(locs, list) else str(locs),
+                    "url":      j.get("url", ""),
+                    "posted":   _ts_to_date(j.get("date_posted")),
+                })
+        except Exception as e:
+            print("  WARN Simplify feed error:", e)
+    return jobs
+
+
+def fetch_amazon():
     url = (
         "https://www.amazon.jobs/en/search.json"
         "?base_query=software+engineer&loc_query=United+States"
         "&job_type=Full-Time&category=software-development&result_limit=100"
     )
-    r = requests.get(url, headers=HEADERS, timeout=20)
-    r.raise_for_status()
-    return [
-        {
-            "id":       f"amz_{j['id_icims']}",
-            "title":    j.get("title", ""),
-            "location": j.get("normalized_location", ""),
-            "url":      "https://www.amazon.jobs" + j.get("job_path", ""),
-            "posted":   j.get("posted_date", ""),
-        }
-        for j in r.json().get("jobs", [])
-    ]
-
-
-def google_jobs():
-    results = []
-    for page in range(1, 4):
-        url = (
-            "https://careers.google.com/api/v3/search/"
-            f"?q=software+engineer&page={page}&pageSize=50"
-            "&employment_type=INTERN&employment_type=FULL_TIME"
-            "&location=United+States"
-        )
+    try:
         r = requests.get(url, headers=HEADERS, timeout=20)
-        if r.status_code != 200:
-            break
-        jobs = r.json().get("jobs", [])
-        if not jobs:
-            break
-        for j in jobs:
-            results.append({
-                "id":       f"goog_{j.get('id','')}",
+        r.raise_for_status()
+        return [
+            {
+                "id":       "amz_" + str(j["id_icims"]),
+                "company":  "Amazon",
                 "title":    j.get("title", ""),
-                "location": ", ".join(j.get("locations", [])),
-                "url":      "https://careers.google.com/jobs/results/" + j.get("id","").split("/")[-1],
-                "posted":   j.get("publish_date", ""),
-            })
-    return results
-
-
-def meta_jobs():
-    url = (
-        "https://www.metacareers.com/jobs/search/"
-        "?q=software+engineer&roles[0]=Intern&roles[1]=University+Grad"
-        "&teams[0]=Software+Engineering&is_leadership=0&sort_by_new=true"
-    )
-    r = requests.get(url, headers=HEADERS, timeout=20)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
-    tag  = soup.find("script", {"id": "__NEXT_DATA__"})
-    if not tag:
+                "location": j.get("normalized_location", ""),
+                "url":      "https://www.amazon.jobs" + j.get("job_path", ""),
+                "posted":   j.get("posted_date", ""),
+            }
+            for j in r.json().get("jobs", [])
+        ]
+    except Exception as e:
+        print("  WARN Amazon error:", e)
         return []
-    jobs_raw = (
-        json.loads(tag.string)
-            .get("props", {})
-            .get("pageProps", {})
-            .get("jobs", [])
-    )
-    return [
-        {
-            "id":       f"meta_{j.get('id','')}",
-            "title":    j.get("title", ""),
-            "location": (j.get("locations") or [""])[0],
-            "url":      "https://www.metacareers.com/jobs/" + str(j.get("id","")),
-            "posted":   j.get("post_date", ""),
-        }
-        for j in jobs_raw
-    ]
 
-
-def microsoft_jobs():
-    url = (
-        "https://gcsservices.careers.microsoft.com/search/api/v1/search"
-        "?q=software+engineer&lc=United+States"
-        "&exp=Students+and+recent+graduates&pgSz=50&pg=1"
-    )
-    r = requests.get(url, headers=HEADERS, timeout=20)
-    r.raise_for_status()
-    jobs = (
-        r.json()
-         .get("operationResult", {})
-         .get("result", {})
-         .get("jobs", [])
-    )
-    return [
-        {
-            "id":       f"msft_{j.get('jobId','')}",
-            "title":    j.get("title", ""),
-            "location": j.get("primaryLocation", ""),
-            "url":      "https://jobs.careers.microsoft.com/global/en/job/" + j.get("jobId",""),
-            "posted":   j.get("postedDate", ""),
-        }
-        for j in jobs
-    ]
-
-
-def apple_jobs():
-    url = (
-        "https://jobs.apple.com/api/role/search"
-        "?query=software+engineer&team=MLAI,SFTWR&location=USA"
-        "&page=1&sort=newest"
-    )
-    r = requests.get(url, headers=HEADERS, timeout=20)
-    r.raise_for_status()
-    return [
-        {
-            "id":       f"aapl_{j.get('positionId','')}",
-            "title":    j.get("postingTitle", ""),
-            "location": (j.get("locations") or [{}])[0].get("name", ""),
-            "url":      "https://jobs.apple.com/en-us/details/" + j.get("positionId",""),
-            "posted":   j.get("postDateTime", "")[:10],
-        }
-        for j in r.json().get("searchResults", [])
-    ]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# COMPANY LIST
-# ─────────────────────────────────────────────────────────────────────────────
-
-COMPANIES = [
-    # ── FAANG ────────────────────────────────────────────────
-    ("Amazon",       amazon_jobs),
-    ("Google",       google_jobs),
-    ("Meta",         meta_jobs),
-    ("Microsoft",    microsoft_jobs),
-    ("Apple",        apple_jobs),
-
-    # ── Top Tech (strong H1B, backend/infra/ML fit) ──────────
-    ("Netflix",      lambda: greenhouse("netflix")),
-    ("Stripe",       lambda: greenhouse("stripe")),
-    ("Databricks",   lambda: greenhouse("databricks")),
-    ("OpenAI",       lambda: greenhouse("openai")),
-    ("Anthropic",    lambda: greenhouse("anthropic")),
-    ("Cloudflare",   lambda: greenhouse("cloudflare")),
-    ("Datadog",      lambda: greenhouse("datadog")),
-    ("Snowflake",    lambda: greenhouse("snowflakecomputing")),
-    ("MongoDB",      lambda: greenhouse("mongodb")),
-    ("Palantir",     lambda: greenhouse("palantirtechnologies")),
-    ("Scale AI",     lambda: greenhouse("scaleai")),
-    ("Waymo",        lambda: greenhouse("waymo")),
-    ("Airbnb",       lambda: greenhouse("airbnb")),
-    ("DoorDash",     lambda: greenhouse("doordasheng")),
-    ("Lyft",         lambda: greenhouse("lyft")),
-    ("Brex",         lambda: greenhouse("brex")),
-    ("Ramp",         lambda: lever("ramp")),
-    ("Anduril",      lambda: greenhouse("anduril")),
-    ("SpaceX",       lambda: greenhouse("spacex")),
-    ("Reddit",       lambda: greenhouse("reddit")),
-    ("Snap",         lambda: greenhouse("snap")),
-    ("Okta",         lambda: greenhouse("okta")),
-    ("Palo Alto Networks", lambda: greenhouse("paloaltonetworks")),
-    ("CrowdStrike",  lambda: greenhouse("crowdstrikecareers")),
-    ("Duolingo",     lambda: greenhouse("duolingo")),
-    ("Asana",        lambda: greenhouse("asana")),
-    ("Intuit",       lambda: greenhouse("intuit")),
-    ("HubSpot",      lambda: greenhouse("hubspot")),
-    ("Twilio",       lambda: greenhouse("twilio")),
-    ("Shopify",      lambda: greenhouse("shopify")),
-    ("Coinbase",     lambda: greenhouse("coinbase")),
-    ("Robinhood",    lambda: greenhouse("robinhood")),
-    ("Spotify",      lambda: lever("spotify")),
-    ("Instacart",    lambda: lever("instacart")),
-    ("Rippling",     lambda: lever("rippling")),
-
-    # ── Quant / Trading ──────────────────────────────────────
-    ("Jane Street",  lambda: greenhouse("janestreet")),
-    ("Hudson River Trading", lambda: greenhouse("hudsonrivertrading")),
-    ("Two Sigma",    lambda: greenhouse("twosigma")),
-    ("Citadel",      lambda: greenhouse("citadel")),
-    ("Citadel Securities", lambda: greenhouse("citadelsecurities")),
-    ("Akuna Capital", lambda: greenhouse("akunacapital")),
-    ("Optiver",      lambda: greenhouse("optiver")),
-    ("IMC Trading",  lambda: greenhouse("imc")),
-    ("Five Rings",   lambda: greenhouse("fiverings")),
-    ("SIG",          lambda: greenhouse("sig")),
-]
-
-# ─────────────────────────────────────────────────────────────────────────────
-# FILTERING
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# FILTERS
+# ---------------------------------------------------------------------------
 
 def is_relevant(title):
     t = title.lower()
-    return (
-        any(kw in t for kw in TITLE_KEYWORDS) and
-        not any(ex in t for ex in EXCLUDE_KEYWORDS)
-    )
+    return (any(kw in t for kw in TITLE_KEYWORDS) and
+            not any(ex in t for ex in EXCLUDE_KEYWORDS))
+
 
 def is_usa(location):
     if not location:
         return True
     loc = location.lower()
-    # exclude explicitly non-US
     non_us = [
-        "canada", "mexico", "uk", "united kingdom", "ireland",
-        "estonia", "poland", "australia", "hong kong", "india",
-        "singapore", "germany", "france", "netherlands",
+        "canada", "mexico", "united kingdom", " uk", "ireland", "estonia",
+        "poland", "australia", "hong kong", "india", "singapore", "germany",
+        "france", "netherlands", "brazil", "japan", "korea", "china",
+        "spain", "italy", "sweden", "israel", "toronto", "vancouver",
+        "london", "dublin", "bangalore",
     ]
-    if any(x in loc for x in non_us):
+    if any(x in loc for x in non_us) and "united states" not in loc and ", ca" not in loc:
         return False
     return True
 
-# ─────────────────────────────────────────────────────────────────────────────
+
+def is_priority(company):
+    c = company.lower()
+    return any(p in c for p in PRIORITY_COMPANIES)
+
+
+def is_digest_company(company):
+    c = company.lower()
+    return any(d in c for d in DIGEST_COMPANIES)
+
+# ---------------------------------------------------------------------------
 # STATE
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
-def load_seen():
-    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE) as f:
-            return set(json.load(f))
-    return set()
+def load_json(path, default):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if os.path.exists(path):
+        with open(path) as f:
+            return json.load(f)
+    return default
 
-def save_seen(seen):
-    with open(STATE_FILE, "w") as f:
-        json.dump(list(seen), f)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# EMAIL
-# ─────────────────────────────────────────────────────────────────────────────
+def save_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(data, f)
+
+# ---------------------------------------------------------------------------
+# EMAIL (SendGrid HTTP API)
+# ---------------------------------------------------------------------------
 
 def send_email(subject, html):
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"]    = EMAIL_FROM
-    msg["To"]      = EMAIL_TO
-    msg.attach(MIMEText(html, "html"))
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
-        smtp.login(EMAIL_FROM, SMTP_PASSWORD)
-        smtp.send_message(msg)
-
-
-def alert_email(new_jobs):
-    rows = "".join(f"""
-        <tr>
-          <td style="padding:8px;border-bottom:1px solid #eee"><b>{j['company']}</b></td>
-          <td style="padding:8px;border-bottom:1px solid #eee">
-            <a href="{j['url']}" style="color:#0066cc">{j['title']}</a></td>
-          <td style="padding:8px;border-bottom:1px solid #eee">{j['location']}</td>
-          <td style="padding:8px;border-bottom:1px solid #eee">{j.get('posted','')}</td>
-        </tr>""" for j in new_jobs)
-
-    html = f"""
-    <html><body style="font-family:sans-serif;max-width:900px;margin:auto">
-      <h2 style="color:#d63031">🚨 {len(new_jobs)} new FAANG+ role(s) — {datetime.now():%b %d %H:%M}</h2>
-      <table style="border-collapse:collapse;width:100%">
-        <thead><tr style="background:#f4f4f4">
-          <th style="padding:8px;text-align:left">Company</th>
-          <th style="padding:8px;text-align:left">Role</th>
-          <th style="padding:8px;text-align:left">Location</th>
-          <th style="padding:8px;text-align:left">Posted</th>
-        </tr></thead>
-        <tbody>{rows}</tbody>
-      </table>
-    </body></html>"""
-
-    send_email(f"🚨 {len(new_jobs)} new FAANG+ SDE role(s) posted!", html)
-    print(f"  ✉️  Alert sent — {len(new_jobs)} new jobs")
-
-
-def heartbeat_email(stats):
-    rows = "".join(
-        f"<tr><td style='padding:6px'>{s['company']}</td>"
-        f"<td style='padding:6px;color:{'green' if s['ok'] else 'red'}'>"
-        f"{'✅ ' + str(s['count']) + ' jobs' if s['ok'] else '❌ ' + s['error']}</td></tr>"
-        for s in stats
+    import urllib.request
+    data = json.dumps({
+        "personalizations": [{"to": [{"email": EMAIL_TO}]}],
+        "from": {"email": EMAIL_FROM},
+        "subject": subject,
+        "content": [{"type": "text/html", "value": html}],
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.sendgrid.com/v3/mail/send",
+        data=data,
+        headers={
+            "Authorization": "Bearer " + SENDGRID_API_KEY,
+            "Content-Type": "application/json",
+        },
     )
-    html = f"""
-    <html><body style="font-family:sans-serif;max-width:700px;margin:auto">
-      <h2 style="color:#00b894">💚 Job Monitor — Daily Heartbeat</h2>
-      <p>Still running as of <b>{datetime.now():%b %d, %Y %H:%M UTC}</b></p>
-      <table style="border-collapse:collapse;width:100%">
-        <thead><tr style="background:#f4f4f4">
-          <th style="padding:6px;text-align:left">Company</th>
-          <th style="padding:6px;text-align:left">Status</th>
-        </tr></thead>
-        <tbody>{rows}</tbody>
-      </table>
-      <p style="color:#888;font-size:12px">Next heartbeat in ~24 hours</p>
-    </body></html>"""
-    send_email("💚 FAANG+ Monitor — still running", html)
-    print("  💚 Heartbeat sent")
+    try:
+        urllib.request.urlopen(req)
+        return True
+    except Exception as e:
+        print("  WARN Email failed:", e)
+        return False
 
-# ─────────────────────────────────────────────────────────────────────────────
+
+def job_rows(jobs):
+    rows = ""
+    for j in jobs:
+        rows += (
+            "<tr>"
+            "<td style='padding:8px;border-bottom:1px solid #eee'><b>" + j["company"] + "</b></td>"
+            "<td style='padding:8px;border-bottom:1px solid #eee'>"
+            "<a href='" + j["url"] + "' style='color:#0066cc'>" + j["title"] + "</a></td>"
+            "<td style='padding:8px;border-bottom:1px solid #eee'>" + j["location"] + "</td>"
+            "</tr>"
+        )
+    return rows
+
+
+def instant_alert(jobs):
+    html = (
+        "<html><body style='font-family:sans-serif;max-width:900px;margin:auto'>"
+        "<h2 style='color:#d63031'>NEW FAANG+ " + str(len(jobs)) + " role(s) - " +
+        datetime.now().strftime("%b %d %H:%M") + "</h2>"
+        "<table style='border-collapse:collapse;width:100%'>"
+        "<thead><tr style='background:#f4f4f4'>"
+        "<th style='padding:8px;text-align:left'>Company</th>"
+        "<th style='padding:8px;text-align:left'>Role</th>"
+        "<th style='padding:8px;text-align:left'>Location</th>"
+        "</tr></thead><tbody>" + job_rows(jobs) + "</tbody></table>"
+        "</body></html>"
+    )
+    if send_email("FAANG+ " + str(len(jobs)) + " new role(s)!", html):
+        print("  ALERT instant sent -", len(jobs), "priority jobs")
+
+
+def daily_digest(digest_jobs, sources_ok):
+    count = len(digest_jobs)
+    status = "all sources OK" if sources_ok else "some sources failed"
+    if digest_jobs:
+        body = job_rows(digest_jobs)
+    else:
+        body = "<tr><td colspan=3 style='padding:8px;color:#888'>No new broader-company roles today.</td></tr>"
+    html = (
+        "<html><body style='font-family:sans-serif;max-width:900px;margin:auto'>"
+        "<h2 style='color:#00b894'>Daily Digest - " + datetime.now().strftime("%b %d, %Y") + "</h2>"
+        "<p>" + str(count) + " new role(s) from broader companies in the last 24h. "
+        "Monitor heartbeat: " + status + ".</p>"
+        "<table style='border-collapse:collapse;width:100%'>"
+        "<thead><tr style='background:#f4f4f4'>"
+        "<th style='padding:8px;text-align:left'>Company</th>"
+        "<th style='padding:8px;text-align:left'>Role</th>"
+        "<th style='padding:8px;text-align:left'>Location</th>"
+        "</tr></thead><tbody>" + body + "</tbody></table>"
+        "<p style='color:#888;font-size:12px'>FAANG+ roles are sent instantly. This digest covers everything else.</p>"
+        "</body></html>"
+    )
+    if send_email("Daily job digest - " + str(count) + " new roles", html):
+        print("  DIGEST sent -", count, "broader jobs")
+
+# ---------------------------------------------------------------------------
 # MAIN
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
-def run_once(seen):
-    new_jobs = []
-    stats    = []
-    for name, fetcher in COMPANIES:
-        try:
-            jobs = fetcher()
-            count = 0
-            for j in jobs:
-                if j["id"] in seen:
-                    continue
-                if not is_relevant(j["title"]):
-                    continue
-                if not is_usa(j["location"]):
-                    continue
-                seen.add(j["id"])
-                j["company"] = name
-                new_jobs.append(j)
-                count += 1
-                print(f"  ✅ NEW: [{name}] {j['title']} — {j['location']}")
-            stats.append({"company": name, "ok": True, "count": len(jobs)})
-        except Exception as e:
-            print(f"  ⚠️  {name}: {e}")
-            stats.append({"company": name, "ok": False, "error": str(e)[:60]})
-    return new_jobs, stats
+def run_once(seen, pending_digest):
+    all_jobs = fetch_simplify() + fetch_amazon()
+    sources_ok = len(all_jobs) > 0
+
+    instant = []
+    for j in all_jobs:
+        if j["id"] in seen:
+            continue
+        if not is_relevant(j["title"]):
+            continue
+        if not is_usa(j["location"]):
+            continue
+        seen.add(j["id"])
+
+        if is_priority(j["company"]):
+            instant.append(j)
+            print("  PRIORITY:", j["company"], "-", j["title"])
+        elif is_digest_company(j["company"]):
+            pending_digest.append(j)
+        # else: not a tracked company -> dropped silently
+
+    if instant:
+        instant_alert(instant)
+
+    return sources_ok
 
 
 def main():
     print("=" * 55)
-    print("  FAANG+ Monitor starting")
-    print(f"  {len(COMPANIES)} companies · every {POLL_INTERVAL_SECS//60} min")
+    print("  Job Monitor v2 - Simplify feeds + Amazon API")
+    print("  Instant:", ", ".join(PRIORITY_COMPANIES[:6]), "...")
+    print("  Poll every", POLL_INTERVAL_SECS // 60, "min")
     print("=" * 55)
 
-    seen       = load_seen()
-    first_run  = len(seen) == 0
-    last_heartbeat = date.today()
+    seen           = set(load_json(STATE_FILE, []))
+    pending_digest = load_json(DIGEST_FILE, [])
+    first_run      = len(seen) == 0
+    last_digest    = date.today()
 
     while True:
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
-        print(f"\n[{now}] Polling...")
+        print("\n[" + now + "] Polling...")
 
-        new_jobs, stats = run_once(seen)
-        save_seen(seen)
+        sources_ok = run_once(seen, pending_digest)
+        save_json(STATE_FILE, list(seen))
+        save_json(DIGEST_FILE, pending_digest)
 
         if first_run:
-            print(f"  First run — indexed {len(seen)} existing jobs. No email sent.")
+            print("  First run - indexed", len(seen), "existing jobs. No email.")
+            pending_digest.clear()
+            save_json(DIGEST_FILE, pending_digest)
             first_run = False
-        elif new_jobs:
-            alert_email(new_jobs)
-        else:
-            print("  No new jobs.")
 
-        # Daily heartbeat
-        if date.today() > last_heartbeat:
-            heartbeat_email(stats)
-            last_heartbeat = date.today()
+        if date.today() > last_digest:
+            daily_digest(pending_digest, sources_ok)
+            pending_digest.clear()
+            save_json(DIGEST_FILE, pending_digest)
+            last_digest = date.today()
 
-        print(f"  Sleeping {POLL_INTERVAL_SECS // 60}m...")
+        print("  Sleeping", POLL_INTERVAL_SECS // 60, "m... (digest queue:", len(pending_digest), ")")
         time.sleep(POLL_INTERVAL_SECS)
 
 
