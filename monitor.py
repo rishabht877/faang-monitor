@@ -140,29 +140,45 @@ def fetch_simplify():
 
 
 def fetch_amazon():
-    url = (
-        "https://www.amazon.jobs/en/search.json"
-        "?base_query=software+engineer&loc_query=United+States"
-        "&job_type=Full-Time&category=software-development&result_limit=100"
-    )
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=20)
-        r.raise_for_status()
-        return [
-            {
-                "id":       "amz_" + str(j["id_icims"]),
-                "company":  "Amazon",
-                "title":    j.get("title", ""),
-                "location": j.get("normalized_location", ""),
-                "url":      "https://www.amazon.jobs" + j.get("job_path", ""),
-                "posted":   j.get("posted_date", ""),
-                "season":   "Full-Time",
-            }
-            for j in r.json().get("jobs", [])
-        ]
-    except Exception as e:
-        print("  WARN Amazon error:", e)
-        return []
+    # Query multiple job types + queries so we catch internships AND full-time.
+    # Amazon's API uses job_type=Full-Time / Intern; interns are a separate type.
+    queries = [
+        ("software engineer",        "Full-Time", "Full-Time"),
+        ("software development",     "Full-Time", "Full-Time"),
+        ("software engineer intern", "Intern",    "Internship"),
+        ("software development engineer internship", "Intern", "Internship"),
+        ("software engineer",        "Intern",    "Internship"),
+    ]
+    seen_ids = set()
+    out = []
+    for base_query, job_type, season_label in queries:
+        url = (
+            "https://www.amazon.jobs/en/search.json"
+            "?base_query=" + base_query.replace(" ", "+") +
+            "&loc_query=United+States"
+            "&job_type=" + job_type +
+            "&category=software-development&result_limit=100"
+        )
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=20)
+            r.raise_for_status()
+            for j in r.json().get("jobs", []):
+                jid = str(j.get("id_icims", j.get("job_path", "")))
+                if jid in seen_ids:
+                    continue
+                seen_ids.add(jid)
+                out.append({
+                    "id":       "amz_" + jid,
+                    "company":  "Amazon",
+                    "title":    j.get("title", ""),
+                    "location": j.get("normalized_location", ""),
+                    "url":      "https://www.amazon.jobs" + j.get("job_path", ""),
+                    "posted":   j.get("posted_date", ""),
+                    "season":   season_label,
+                })
+        except Exception as e:
+            print("  WARN Amazon query failed (" + job_type + "/" + base_query + "):", e)
+    return out
 
 
 # Direct Greenhouse scrapers for priority companies that open EARLY
