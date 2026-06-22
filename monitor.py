@@ -37,6 +37,8 @@ PRIORITY_COMPANIES = [
     # added per request
     "robinhood", "coinbase", "figma", "rippling", "snap", "reddit",
     "doordash", "jane street", "citadel",
+    # referral companies - instant alert so I can move fast with a referral
+    "fidelity", "jpmorgan", "jp morgan", "j.p. morgan",
 ]
 
 # DIGEST allowlist -> these get bundled into the daily digest.
